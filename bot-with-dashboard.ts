@@ -136,6 +136,20 @@ let CONFIG = {
     minRiskReward: 1.5,
   },
 
+  timing: {
+    tradingHoursEnabled: true,
+    tradingHoursStartUtc: 8,
+    tradingHoursEndUtc: 23,
+    minHoursToResolution: 2,
+    maxDaysToResolution: 30,
+    cooldownMs: {
+      smartMoney: 5 * 60 * 1000,
+      arbitrage:  60 * 1000,
+      dipArb:     15 * 60 * 1000,
+      direct:     10 * 60 * 1000,
+    },
+  },
+
   dryRun: process.env.DRY_RUN !== 'false',
 };
 
@@ -182,6 +196,13 @@ const state: BotState = {
   btcTrend: 'neutral',
   ethTrend: 'neutral',
   solTrend: 'neutral',
+
+  lastTradeTime: {
+    smartMoney: 0,
+    arbitrage: 0,
+    dipArb: {},
+    direct: 0,
+  },
 
   dipArb: {
     marketName: null,
@@ -238,6 +259,8 @@ function canTrade(): boolean {
     log('ERROR', '🛑 Trading permanently halted - total loss limit reached');
     return false;
   }
+
+  if (!isWithinTradingHours()) return false;
 
   // Reset daily PnL if new day
   const daysSinceReset = (Date.now() - state.lastDailyReset) / (1000 * 60 * 60 * 24);
@@ -312,6 +335,46 @@ function canTrade(): boolean {
   return true;
 }
 
+function isWithinTradingHours(): boolean {
+  if (!CONFIG.timing.tradingHoursEnabled) return true;
+  const hour = new Date().getUTCHours();
+  const { tradingHoursStartUtc: start, tradingHoursEndUtc: end } = CONFIG.timing;
+  const inWindow = start <= end
+    ? hour >= start && hour < end
+    : hour >= start || hour < end;
+  if (!inWindow) log('INFO', `Outside trading hours (UTC ${hour}:xx, window ${start}:00–${end}:00)`);
+  return inWindow;
+}
+
+function isMarketTimingValid(endDateIso: string | undefined): boolean {
+  if (!endDateIso) return true;
+  const msToEnd = new Date(endDateIso).getTime() - Date.now();
+  const hoursToEnd = msToEnd / (1000 * 60 * 60);
+  const daysToEnd = msToEnd / (1000 * 60 * 60 * 24);
+  if (hoursToEnd < CONFIG.timing.minHoursToResolution) {
+    log('INFO', `Skipping market: resolves in ${hoursToEnd.toFixed(1)}h (min ${CONFIG.timing.minHoursToResolution}h)`);
+    return false;
+  }
+  if (daysToEnd > CONFIG.timing.maxDaysToResolution) {
+    log('INFO', `Skipping market: resolves in ${daysToEnd.toFixed(0)}d (max ${CONFIG.timing.maxDaysToResolution}d)`);
+    return false;
+  }
+  return true;
+}
+
+function isOnCooldown(strategy: 'smartMoney' | 'arbitrage' | 'dipArb' | 'direct', coin?: string): boolean {
+  const cooldown = CONFIG.timing.cooldownMs[strategy];
+  const lastTime = strategy === 'dipArb' && coin
+    ? (state.lastTradeTime.dipArb[coin] ?? 0)
+    : state.lastTradeTime[strategy as 'smartMoney' | 'arbitrage' | 'direct'];
+  const elapsed = Date.now() - lastTime;
+  if (elapsed < cooldown) {
+    log('INFO', `${strategy}${coin ? `(${coin})` : ''} on cooldown: ${((cooldown - elapsed) / 1000).toFixed(0)}s remaining`);
+    return true;
+  }
+  return false;
+}
+
 // 🔴 FIXED: Enhanced trade recording with win tracking
 function recordTrade(profit: number, strategy: string) {
   state.tradesExecuted++;
@@ -328,10 +391,10 @@ function recordTrade(profit: number, strategy: string) {
     state.consecutiveWins++;
   }
 
-  if (strategy === 'smartMoney') state.smartMoneyTrades++;
-  else if (strategy === 'arbitrage') state.arbTrades++;
+  if (strategy === 'smartMoney') { state.smartMoneyTrades++; state.lastTradeTime.smartMoney = Date.now(); }
+  else if (strategy === 'arbitrage') { state.arbTrades++; state.lastTradeTime.arbitrage = Date.now(); }
   else if (strategy === 'dipArb') state.dipArbTrades++;
-  else if (strategy === 'direct') state.directTrades++;
+  else if (strategy === 'direct') { state.directTrades++; state.lastTradeTime.direct = Date.now(); }
 
   updateDashboard();
 }
@@ -420,6 +483,7 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
       async (trade: SmartMoneyTrade) => {
         if (!CONFIG.smartMoney.enabled) return;
         if (!canTrade()) return;
+        if (isOnCooldown('smartMoney')) return;
 
         // ... (inside setupSmartMoney callback)
         // Add to smart money signals for dashboard
@@ -504,6 +568,7 @@ async function setupArbitrage(_sdk: PolymarketSDK) {
 
   arbService.on('execution', (result) => {
     if (result.success) {
+      if (isOnCooldown('arbitrage')) return;
       state.arbProfit += result.profit || 0;
       recordTrade(result.profit || 0, 'arbitrage');
       log('TRADE', `Arb trade executed: +$${(result.profit || 0).toFixed(2)} profit`);
@@ -618,6 +683,9 @@ async function setupDipArb(sdk: PolymarketSDK) {
 
   sdk.dipArb.on('execution', (r: any) => {
     if (r.success) {
+      const coin = (state.activeDipArbMarket || '').match(/btc|eth|sol/i)?.[0]?.toUpperCase() || 'ETH';
+      if (r.leg === 'leg1' && isOnCooldown('dipArb', coin)) return;
+      if (r.leg === 'leg1') state.lastTradeTime.dipArb[coin] = Date.now();
       const price = r.price ? r.price.toFixed(3) : '??';
       const shares = r.shares ? r.shares.toFixed(1) : '??';
       const market = state.activeDipArbMarket || 'unknown-market';
@@ -862,12 +930,14 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
   async function checkTrendTrades() {
     if (!CONFIG.directTrading.enabled) return;
     if (!canTrade()) return;
+    if (isOnCooldown('direct')) return;
 
     try {
       const trendingMarkets = await sdk.gammaApi.getTrendingMarkets(5);
 
       for (const market of trendingMarkets) {
         if (!market.conditionId) continue;
+        if (!isMarketTimingValid((market as any).endDateIso)) continue;
 
         try {
           const fullMarket = await sdk.getMarket(market.conditionId);

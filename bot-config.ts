@@ -150,6 +150,20 @@ const CONFIG = {
     minRiskReward: 1.5,  // Minimum 1.5:1 risk/reward ratio
   },
 
+  timing: {
+    tradingHoursEnabled: true,
+    tradingHoursStartUtc: 8,   // 8am UTC
+    tradingHoursEndUtc: 23,    // 11pm UTC
+    minHoursToResolution: 2,   // Skip markets resolving in < 2h
+    maxDaysToResolution: 30,   // Skip markets resolving > 30 days out
+    cooldownMs: {
+      smartMoney: 5 * 60 * 1000,
+      arbitrage:  60 * 1000,
+      dipArb:     15 * 60 * 1000,
+      direct:     10 * 60 * 1000,
+    },
+  },
+
   dryRun: process.env.DRY_RUN !== 'false',
 };
 
@@ -203,6 +217,13 @@ interface BotState {
   btcTrend: 'up' | 'down' | 'neutral';
   ethTrend: 'up' | 'down' | 'neutral';
   solTrend: 'up' | 'down' | 'neutral';
+
+  lastTradeTime: {
+    smartMoney: number;
+    arbitrage: number;
+    dipArb: Record<string, number>;
+    direct: number;
+  };
 }
 
 const state: BotState = {
@@ -242,6 +263,13 @@ const state: BotState = {
   btcTrend: 'neutral',
   ethTrend: 'neutral',
   solTrend: 'neutral',
+
+  lastTradeTime: {
+    smartMoney: 0,
+    arbitrage: 0,
+    dipArb: {},
+    direct: 0,
+  },
 };
 
 // ============================================================================
@@ -266,6 +294,8 @@ function canTrade(): boolean {
     log('ERROR', '🛑 Trading permanently halted - total loss limit reached');
     return false;
   }
+
+  if (!isWithinTradingHours()) return false;
 
   // Reset daily PnL if new day
   const daysSinceReset = (Date.now() - state.lastDailyReset) / (1000 * 60 * 60 * 24);
@@ -339,6 +369,46 @@ function canTrade(): boolean {
   return true;
 }
 
+function isWithinTradingHours(): boolean {
+  if (!CONFIG.timing.tradingHoursEnabled) return true;
+  const hour = new Date().getUTCHours();
+  const { tradingHoursStartUtc: start, tradingHoursEndUtc: end } = CONFIG.timing;
+  const inWindow = start <= end
+    ? hour >= start && hour < end
+    : hour >= start || hour < end;
+  if (!inWindow) log('INFO', `Outside trading hours (UTC ${hour}:xx, window ${start}:00–${end}:00)`);
+  return inWindow;
+}
+
+function isMarketTimingValid(endDateIso: string | undefined): boolean {
+  if (!endDateIso) return true;
+  const msToEnd = new Date(endDateIso).getTime() - Date.now();
+  const hoursToEnd = msToEnd / (1000 * 60 * 60);
+  const daysToEnd = msToEnd / (1000 * 60 * 60 * 24);
+  if (hoursToEnd < CONFIG.timing.minHoursToResolution) {
+    log('INFO', `Skipping market: resolves in ${hoursToEnd.toFixed(1)}h (min ${CONFIG.timing.minHoursToResolution}h)`);
+    return false;
+  }
+  if (daysToEnd > CONFIG.timing.maxDaysToResolution) {
+    log('INFO', `Skipping market: resolves in ${daysToEnd.toFixed(0)}d (max ${CONFIG.timing.maxDaysToResolution}d)`);
+    return false;
+  }
+  return true;
+}
+
+function isOnCooldown(strategy: 'smartMoney' | 'arbitrage' | 'dipArb' | 'direct', coin?: string): boolean {
+  const cooldown = CONFIG.timing.cooldownMs[strategy];
+  const lastTime = strategy === 'dipArb' && coin
+    ? (state.lastTradeTime.dipArb[coin] ?? 0)
+    : state.lastTradeTime[strategy as 'smartMoney' | 'arbitrage' | 'direct'];
+  const elapsed = Date.now() - lastTime;
+  if (elapsed < cooldown) {
+    log('INFO', `${strategy}${coin ? `(${coin})` : ''} on cooldown: ${((cooldown - elapsed) / 1000).toFixed(0)}s remaining`);
+    return true;
+  }
+  return false;
+}
+
 // 🔴 FIXED: Enhanced trade recording with win tracking
 function recordTrade(profit: number, strategy: string) {
   state.tradesExecuted++;
@@ -355,10 +425,10 @@ function recordTrade(profit: number, strategy: string) {
     state.consecutiveWins++;
   }
 
-  if (strategy === 'smartMoney') state.smartMoneyTrades++;
-  else if (strategy === 'arbitrage') state.arbTrades++;
+  if (strategy === 'smartMoney') { state.smartMoneyTrades++; state.lastTradeTime.smartMoney = Date.now(); }
+  else if (strategy === 'arbitrage') { state.arbTrades++; state.lastTradeTime.arbitrage = Date.now(); }
   else if (strategy === 'dipArb') state.dipArbTrades++;
-  else if (strategy === 'direct') state.directTrades++;
+  else if (strategy === 'direct') { state.directTrades++; state.lastTradeTime.direct = Date.now(); }
 }
 
 // 🔴 NEW: Dynamic position sizing based on performance
@@ -487,6 +557,7 @@ async function setupSmartMoney(sdk: PolymarketSDK) {
       dryRun: false,
       onTrade: (trade, result) => {
         if (result.success) {
+          if (isOnCooldown('smartMoney')) return;
           log('TRADE', `Copied ${trade.side} from ${trade.traderAddress.slice(0, 8)}...`);
           recordTrade(0, 'smartMoney');
         }
@@ -522,6 +593,7 @@ async function setupArbitrage(sdk: PolymarketSDK) {
 
   arbService.on('execution', (result) => {
     if (result.success) {
+      if (isOnCooldown('arbitrage')) return;
       state.arbProfit += result.profit;
       log('TRADE', `Arb executed: +$${result.profit.toFixed(2)}`);
       recordTrade(result.profit, 'arbitrage');
@@ -556,6 +628,9 @@ async function setupDipArb(sdk: PolymarketSDK) {
   sdk.dipArb.on('signal', (s) => log('SIGNAL', `DipArb: ${s.type} ${s.side}`));
   sdk.dipArb.on('execution', (r) => {
     if (r.success) {
+      const coin = (state.activeDipArbMarket || '').match(/btc|eth|sol/i)?.[0]?.toUpperCase() || 'ETH';
+      if (r.leg === 'leg1' && isOnCooldown('dipArb', coin)) return;
+      if (r.leg === 'leg1') state.lastTradeTime.dipArb[coin] = Date.now();
       log('TRADE', `DipArb ${r.leg}: ${r.side}`);
       recordTrade(0, 'dipArb');
     }
@@ -772,11 +847,13 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
 
   async function checkTrendTrades() {
     if (!canTrade()) return;
+    if (isOnCooldown('direct')) return;
 
     const trendingMarkets = await sdk.gammaApi.getTrendingMarkets(5);
 
     for (const market of trendingMarkets) {
       if (!market.conditionId) continue;
+      if (!isMarketTimingValid((market as any).endDateIso)) continue;
 
       try {
         const fullMarket = await sdk.getMarket(market.conditionId);

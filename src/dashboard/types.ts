@@ -51,6 +51,13 @@ export interface BotState {
   ethTrend: 'up' | 'down' | 'neutral';
   solTrend: 'up' | 'down' | 'neutral';
 
+  lastTradeTime: {
+    smartMoney: number;
+    arbitrage: number;
+    dipArb: Record<string, number>;
+    direct: number;
+  };
+
   // DipArb live data
   dipArb: {
     marketName: string | null;
