@@ -1505,6 +1505,10 @@ export class DipArbService extends EventEmitter {
       return;
     }
 
+    if (this.config.shouldExecute && !this.config.shouldExecute(signal, this.market)) {
+      return;
+    }
+
     // CRITICAL: Set isExecuting immediately to prevent duplicate signals from being processed
     // This must happen before any async operations or emit() calls
     this.isExecuting = true;

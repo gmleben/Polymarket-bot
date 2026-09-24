@@ -68,6 +68,8 @@ export interface ArbitrageServiceConfig {
   enableLogging?: boolean;
   /** Cooldown between executions in ms (default: 5000) */
   executionCooldown?: number;
+  /** Called right before auto-execution; return false to skip this opportunity */
+  shouldExecute?: (opportunity: ArbitrageOpportunity) => boolean;
 
   // ===== Rebalancer Config =====
   /** Enable auto-rebalancing (default: false) */
@@ -253,10 +255,11 @@ export class ArbitrageService extends EventEmitter {
   private rateLimiter: RateLimiter;
 
   private market: ArbitrageMarketConfig | null = null;
-  private config: Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval'> & {
+  private config: Omit<Required<ArbitrageServiceConfig>, 'privateKey' | 'rpcUrl' | 'rebalanceInterval' | 'shouldExecute'> & {
     privateKey?: string;
     rpcUrl?: string;
     rebalanceIntervalMs: number;
+    shouldExecute?: (opportunity: ArbitrageOpportunity) => boolean;
   };
 
   private orderbook: OrderbookState = {
@@ -304,6 +307,7 @@ export class ArbitrageService extends EventEmitter {
       autoExecute: config.autoExecute ?? false,
       enableLogging: config.enableLogging ?? true,
       executionCooldown: config.executionCooldown ?? 5000,
+      shouldExecute: config.shouldExecute,
       // Rebalancer config
       enableRebalancer: config.enableRebalancer ?? false,
       minUsdcRatio: config.minUsdcRatio ?? 0.2,
@@ -1286,7 +1290,10 @@ export class ArbitrageService extends EventEmitter {
       // Auto-execute if enabled and cooldown has passed
       if (this.config.autoExecute && !this.isExecuting) {
         const timeSinceLastExecution = Date.now() - this.lastExecutionTime;
-        if (timeSinceLastExecution >= this.config.executionCooldown) {
+        if (
+          timeSinceLastExecution >= this.config.executionCooldown &&
+          (this.config.shouldExecute?.(opportunity) ?? true)
+        ) {
           this.execute(opportunity).catch((error) => {
             this.emit('error', error);
           });

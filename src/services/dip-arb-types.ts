@@ -150,13 +150,20 @@ export interface DipArbServiceConfig {
    * }
    */
   logHandler?: (message: string) => void;
+
+  /**
+   * Called in auto-execute mode right before a leg is executed;
+   * return false to skip the signal.
+   */
+  shouldExecute?: (signal: DipArbSignal, market: DipArbMarketConfig | null) => boolean;
 }
 
 /**
  * 内部配置类型（不包含 logHandler，因为它是纯可选的回调函数）
  */
-export type DipArbConfigInternal = Required<Omit<DipArbServiceConfig, 'logHandler'>> & {
+export type DipArbConfigInternal = Required<Omit<DipArbServiceConfig, 'logHandler' | 'shouldExecute'>> & {
   logHandler?: (message: string) => void;
+  shouldExecute?: (signal: DipArbSignal, market: DipArbMarketConfig | null) => boolean;
 };
 
 /**

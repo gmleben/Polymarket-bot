@@ -153,6 +153,9 @@ export interface AutoCopyTradingOptions {
   /** Dry run mode */
   dryRun?: boolean;
 
+  /** Called right before an order is placed; return false to skip the copy */
+  shouldCopy?: (trade: SmartMoneyTrade) => boolean;
+
   /** Callbacks */
   onTrade?: (trade: SmartMoneyTrade, result: OrderResult) => void;
   onError?: (error: Error) => void;
@@ -1010,6 +1013,11 @@ export class SmartMoneyService {
             : trade.price * (1 - maxSlippage);
 
           const usdcAmount = copyValue; // Already calculated above
+
+          if (options.shouldCopy && !options.shouldCopy(trade)) {
+            stats.tradesSkipped++;
+            return;
+          }
 
           // Execute
           let result: OrderResult;
